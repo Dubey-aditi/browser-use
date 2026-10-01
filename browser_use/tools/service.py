@@ -3,6 +3,7 @@ import enum
 import json
 import logging
 import os
+import time
 from typing import Generic, TypeVar
 
 try:
@@ -27,6 +28,7 @@ from browser_use.browser.events import (
 	UploadFileEvent,
 )
 from browser_use.browser.views import BrowserError
+from browser_use.cache.service import ActionTraceRecorder
 from browser_use.dom.service import EnhancedDOMTreeNode
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.base import BaseChatModel
@@ -110,6 +112,9 @@ class Tools(Generic[Context]):
 	):
 		self.registry = Registry[Context](exclude_actions)
 		self.display_files_in_done_text = display_files_in_done_text
+		# None unless BROWSER_USE_ACTION_TRACE_PATH is set, in which case every action
+		# is recorded with the locators needed to replay it without an LLM.
+		self.action_trace_recorder = ActionTraceRecorder.from_env()
 
 		"""Register all default browser actions"""
 
@@ -1285,6 +1290,16 @@ Validated Code (after quote fixing):
 
 					span_context = nullcontext()
 
+				# Snapshot the element before the action runs: afterwards the DOM has
+				# moved on and the locators can no longer be checked against it.
+				traced = None
+				if self.action_trace_recorder is not None:
+					try:
+						traced = await self.action_trace_recorder.before(browser_session, action_name, params)
+					except Exception as e:
+						logger.debug(f'action trace: pre-action capture failed: {type(e).__name__}: {e}')
+
+				started_at = time.time()
 				with span_context:
 					try:
 						result = await self.registry.execute_action(
@@ -1309,6 +1324,14 @@ Validated Code (after quote fixing):
 
 					if Laminar is not None:
 						Laminar.set_span_output(result)
+
+				if traced is not None and self.action_trace_recorder is not None:
+					try:
+						await self.action_trace_recorder.after(
+							traced, result, (time.time() - started_at) * 1000, browser_session
+						)
+					except Exception as e:
+						logger.debug(f'action trace: post-action record failed: {type(e).__name__}: {e}')
 
 				if isinstance(result, str):
 					return ActionResult(extracted_content=result)
